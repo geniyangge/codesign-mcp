@@ -1,0 +1,366 @@
+#!/usr/bin/env node
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
+
+import { CoDesignClient, parseScreenId, parseShareId } from "./client.js";
+import { isCoDesignError } from "./errors.js";
+import { buildSpec } from "./spec.js";
+import { downloadSlices, downloadPreviews, resolveScreens } from "./tools.js";
+import type { Layer } from "./types.js";
+import { createNamer } from "./utils/filename.js";
+
+const COOKIE = process.env.CODESIGN_COOKIE || "";
+const DEFAULT_OUT = process.env.CODESIGN_OUT_DIR || "./codesign-assets";
+const CONCURRENCY = clampInt(process.env.CODESIGN_CONCURRENCY, 4, 1, 16);
+const TIMEOUT_MS = clampInt(process.env.CODESIGN_TIMEOUT_MS, 30_000, 1_000, 120_000);
+
+const client = new CoDesignClient(COOKIE, { timeoutMs: TIMEOUT_MS });
+
+const server = new McpServer({ name: "codesign-mcp", version: "1.0.0" });
+
+const urlSchema = z
+  .string()
+  .min(1)
+  .describe("CoDesign 分享链接，如 https://codesign.qq.com/app/s/<分享ID>");
+const screenIdSchema = z
+  .number()
+  .int()
+  .positive()
+  .optional()
+  .describe("画板 ID；不传则用链接中的画板，链接也没有则处理全部画板");
+const outDirSchema = z
+  .string()
+  .min(1)
+  .optional()
+  .describe(`输出目录，默认 ${DEFAULT_OUT}`);
+
+server.registerTool(
+  "design_get",
+  {
+    title: "读取设计稿图层标注",
+    description: [
+      "读取腾讯 CoDesign 设计稿：返回设计稿标题、团队、所有画板列表，",
+      "以及每个画板的完整图层标注（坐标、尺寸、字体、字号、字距、颜色、圆角、渐变、效果）。",
+      "传入分享链接即可。若链接里带画板 ID 则只解析该画板，否则解析全部。",
+      "这是还原设计稿的第一步，先用它拿到图层结构。",
+    ].join(""),
+    inputSchema: {
+      url: urlSchema,
+      screenId: screenIdSchema,
+      includeLayers: z.boolean().optional().describe("是否返回图层标注树，默认 true"),
+      maxLayers: z
+        .number()
+        .int()
+        .positive()
+        .max(20000)
+        .optional()
+        .describe("每个画板最多返回多少图层，默认 800；超出会截断并标注 truncated"),
+      maxDepth: z
+        .number()
+        .int()
+        .min(0)
+        .max(50)
+        .optional()
+        .describe("最多下钻几层图层，默认不限"),
+    },
+  },
+  async (args) => run(() => handleDesignGet(args)),
+);
+
+server.registerTool(
+  "design_download_slices",
+  {
+    title: "下载切图",
+    description: [
+      "批量下载 CoDesign 画板的切图。",
+      "自动把 OSS 签名地址转换为可下载的 CDN 地址，按图层名命名文件，同名自动加序号。",
+      "返回每个文件的相对路径、像素尺寸、字节数。",
+    ].join(""),
+    inputSchema: {
+      url: urlSchema,
+      screenId: screenIdSchema,
+      outDir: outDirSchema,
+      scale: z
+        .number()
+        .positive()
+        .optional()
+        .describe("只下载指定倍率的切图，如 2 或 3；不传则下载最高倍率"),
+    },
+  },
+  async (args) => run(() => handleDownloadSlices(args)),
+);
+
+server.registerTool(
+  "design_download_previews",
+  {
+    title: "下载画板预览图",
+    description: [
+      "下载画板的整图预览（PNG），供 AI 直接读图理解视觉设计。",
+      "还原设计稿前建议先调这个，用视觉判断整体布局，再用 design_get 拿精确数值。",
+    ].join(""),
+    inputSchema: {
+      url: urlSchema,
+      screenId: screenIdSchema,
+      outDir: outDirSchema,
+    },
+  },
+  async (args) => run(() => handleDownloadPreviews(args)),
+);
+
+server.registerTool(
+  "design_get_spec",
+  {
+    title: "生成 CSS 还原规格",
+    description: [
+      "把设计稿图层树转换成前端可直接使用的还原规格：",
+      "每个元素的 CSS 盒子（已换算成目标宽度）、font-size/color/letter-spacing/border-radius 等样式、",
+      "字体清单、切图位置表。默认按 750 设计稿转 375 CSS 宽。",
+    ].join(""),
+    inputSchema: {
+      url: urlSchema,
+      screenId: screenIdSchema,
+      cssWidth: z
+        .number()
+        .positive()
+        .max(4096)
+        .optional()
+        .describe("目标 CSS 宽度，默认 375；传 750 则输出设计稿原始 px"),
+      maxLayers: z
+        .number()
+        .int()
+        .positive()
+        .max(20000)
+        .optional()
+        .describe("最多输出多少图层，默认 500；超出会截断并在 notes 里说明"),
+      maxDepth: z
+        .number()
+        .int()
+        .min(0)
+        .max(50)
+        .optional()
+        .describe("最多下钻几层图层，默认不限"),
+    },
+  },
+  async (args) => run(() => handleGetSpec(args)),
+);
+
+/** 统一的执行包装：错误翻译成给 AI 看的提示 */
+async function run(handler: () => Promise<ReturnType<typeof jsonResult>>) {
+  try {
+    return await handler();
+  } catch (e) {
+    return errorResult(formatError(e));
+  }
+}
+
+async function handleDesignGet(args: {
+  url: string;
+  screenId?: number;
+  includeLayers?: boolean;
+  maxLayers?: number;
+  maxDepth?: number;
+}) {
+  const share = await client.getShare(parseShareId(args.url));
+  const includeLayers = args.includeLayers !== false;
+  const targets = await resolveScreens(
+    client,
+    share,
+    args.screenId ?? parseScreenId(args.url),
+    { meta: includeLayers, concurrency: CONCURRENCY },
+  );
+
+  const maxLayers = args.maxLayers ?? 800;
+  const maxDepth = args.maxDepth ?? Infinity;
+
+  const payload: any = {
+    share: {
+      id: share.id,
+      title: share.title,
+      team: share.teamName,
+      permissions: share.permissions,
+    },
+    screens: [] as any[],
+  };
+
+  for (const t of targets) {
+    const entry: any = {
+      id: t.detail.id,
+      name: t.detail.name,
+      size: `${t.detail.width}×${t.detail.height}`,
+      preview: t.detail.previewUrl,
+      sliceCount: t.detail.slicesCount,
+    };
+
+    if (includeLayers && t.tree) {
+      const total = countLayers(t.tree.layers);
+      const limited = limitTree(t.tree.layers, maxLayers, maxDepth);
+      entry.layers = limited.layers;
+      entry.layerCount = total;
+      if (limited.truncated) {
+        entry.truncated = { returned: limited.returned, maxLayers, maxDepth: maxDepth === Infinity ? undefined : maxDepth };
+        payload.warning =
+          `图层总数 ${total} 超过上限 ${maxLayers}，已截断。` +
+          "如需完整数据，可指定 screenId 逐个读取，或调大 maxLayers。";
+      }
+    }
+    payload.screens.push(entry);
+  }
+
+  if (!client.hasCookie) {
+    payload.warning =
+      "未配置 COOKIE，只返回了基础信息。要读取图层标注和切图，请设置环境变量 CODESIGN_COOKIE。";
+  }
+
+  return jsonResult(payload);
+}
+
+async function handleDownloadSlices(args: {
+  url: string;
+  screenId?: number;
+  outDir?: string;
+  scale?: number;
+}) {
+  const share = await client.getShare(parseShareId(args.url));
+  const targets = await resolveScreens(client, share, args.screenId ?? parseScreenId(args.url), {
+    slices: true,
+    concurrency: CONCURRENCY,
+  });
+
+  const outDir = args.outDir || DEFAULT_OUT;
+  const results: any[] = [];
+
+  for (const t of targets) {
+    // 多画板时每个画板一个子目录，目录内各自去重
+    const dir = targets.length > 1 ? `${outDir}/${sanitize(t.detail.name)}` : outDir;
+    const downloaded = await downloadSlices(client, t.slices ?? [], dir, {
+      scale: args.scale,
+      concurrency: CONCURRENCY * 2,
+    });
+    results.push({ screen: t.detail.name, dir, files: downloaded });
+  }
+
+  const total = results.reduce((n, r) => n + r.files.filter((f: any) => f.ok).length, 0);
+  const failed = results.reduce((n, r) => n + r.files.filter((f: any) => !f.ok).length, 0);
+  return jsonResult({ outDir, total, failed, screens: results });
+}
+
+async function handleDownloadPreviews(args: {
+  url: string;
+  screenId?: number;
+  outDir?: string;
+}) {
+  const share = await client.getShare(parseShareId(args.url));
+  // 预览只需要画板详情，不必拉图层树和切图清单
+  const targets = await resolveScreens(client, share, args.screenId ?? parseScreenId(args.url), {
+    concurrency: CONCURRENCY,
+  });
+
+  const outDir = args.outDir || DEFAULT_OUT;
+  const files = await downloadPreviews(client, targets, outDir, {
+    concurrency: CONCURRENCY,
+  });
+  const failed = files.filter((f) => !f.ok).length;
+  return jsonResult({ outDir, total: files.length - failed, failed, files });
+}
+
+async function handleGetSpec(args: {
+  url: string;
+  screenId?: number;
+  cssWidth?: number;
+  maxLayers?: number;
+  maxDepth?: number;
+}) {
+  const share = await client.getShare(parseShareId(args.url));
+  const explicit = args.screenId ?? parseScreenId(args.url);
+  const targets = await resolveScreens(client, share, explicit, {
+    meta: true,
+    slices: true,
+    concurrency: CONCURRENCY,
+  });
+  // 未指定画板时只输出第一个，避免多画板时结果过长
+  const picked = explicit ? targets : targets.slice(0, 1);
+
+  // 规格与下载共用同一套命名规则，保证 file 字段和实际落盘一致
+  const namer = createNamer();
+  const specs = picked.map((t) =>
+    buildSpec(t.detail, t.tree!, t.slices ?? [], {
+      cssWidth: args.cssWidth,
+      maxLayers: args.maxLayers,
+      maxDepth: args.maxDepth,
+      namer,
+    }),
+  );
+  return jsonResult({
+    title: share.title,
+    count: specs.length,
+    totalScreens: targets.length,
+    ...(explicit ? {} : { screenIds: targets.map((t) => ({ id: t.detail.id, name: t.detail.name })) }),
+    specs,
+  });
+}
+
+function countLayers(layers: Layer[]): number {
+  return layers.reduce((n, l) => n + 1 + (l.children?.length ? countLayers(l.children) : 0), 0);
+}
+
+/**
+ * 按数量上限和深度上限裁剪图层树。
+ * 返回的是正常图层对象（子树按需截断），不是扁平的，方便 AI 直接读结构。
+ */
+function limitTree(
+  layers: Layer[],
+  maxLayers: number,
+  maxDepth: number,
+  depth = 0,
+  state = { count: 0, truncated: false },
+): { layers: Layer[]; truncated: boolean; returned: number } {
+  const out: Layer[] = [];
+  for (const l of layers) {
+    if (state.count >= maxLayers) {
+      state.truncated = true;
+      break;
+    }
+    state.count++;
+    if (depth < maxDepth && l.children?.length) {
+      const childLimit = limitTree(l.children, maxLayers, maxDepth, depth + 1, state);
+      const { children, ...rest } = l;
+      out.push({ ...rest, children: childLimit.layers });
+    } else {
+      if (l.children?.length) state.truncated = true;
+      const { children, ...rest } = l;
+      out.push(rest);
+    }
+  }
+  return { layers: out, truncated: state.truncated, returned: state.count };
+}
+
+function sanitize(name: string): string {
+  return name.replace(/[\\/:*?"<>|]/g, "_").trim() || "screen";
+}
+
+function formatError(e: unknown): string {
+  if (isCoDesignError(e)) {
+    const lines = [`❌ ${e.message}`];
+    if (e.hint) lines.push("", e.hint);
+    return lines.join("\n");
+  }
+  return `❌ ${e instanceof Error ? e.message : String(e)}`;
+}
+
+function jsonResult(obj: unknown) {
+  return { content: [{ type: "text" as const, text: JSON.stringify(obj, null, 2) }] };
+}
+
+function errorResult(text: string) {
+  return { content: [{ type: "text" as const, text }], isError: true as const };
+}
+
+function clampInt(value: string | undefined, fallback: number, min: number, max: number): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(n)));
+}
+
+const transport = new StdioServerTransport();
+await server.connect(transport);

@@ -1,0 +1,7 @@
+node_modules/
+dist/
+dist-test/
+codesign-assets/
+*.log
+.DS_Store
+.env
