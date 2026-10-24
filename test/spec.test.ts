@@ -139,20 +139,53 @@ test("buildSpec 输出圆角、透明度与旋转", () => {
   assert.match(style, /rotate\(45deg\)/);
 });
 
-test("pickExports 默认取最高倍率，指定倍率时精确匹配", () => {
-  const item: SliceItem = {
-    id: "1",
+const mkSlice = (scales: number[]): SliceItem => ({
+  id: "1",
+  name: "icon",
+  rect: { x: 0, y: 0, width: 10, height: 10 },
+  exports: scales.map((s) => ({
     name: "icon",
-    rect: { x: 0, y: 0, width: 10, height: 10 },
-    exports: [
-      { name: "icon", scale: 2, format: "png", width: 20, height: 20, downloadUrl: "u2", objectId: "" },
-      { name: "icon", scale: 3, format: "png", width: 30, height: 30, downloadUrl: "u3", objectId: "" },
-    ],
-  };
+    scale: s,
+    format: "png",
+    width: 10 * s,
+    height: 10 * s,
+    downloadUrl: `u${s}`,
+    objectId: "",
+  })),
+});
 
-  assert.deepEqual(pickExports(item).map((e) => e.scale), [3]);
-  assert.deepEqual(pickExports(item, 2).map((e) => e.scale), [2]);
-  // 指定不存在的倍率时退回最高倍率，而不是什么都不下
-  assert.deepEqual(pickExports(item, 4).map((e) => e.scale), [3]);
-  assert.deepEqual(pickExports({ ...item, exports: [] }), []);
+test("pickExports 默认取 2 倍图", () => {
+  // 有 2x 时直接命中，即使存在更高的 3x
+  assert.deepEqual(pickExports(mkSlice([1, 2, 3])).map((p) => p.export.scale), [2]);
+  assert.equal(pickExports(mkSlice([1, 2, 3]))[0].substituted, false);
+});
+
+test("pickExports 用户指定的倍率优先于默认值", () => {
+  const item = mkSlice([1, 2, 3]);
+  // 用户说「要 3 倍图」
+  assert.deepEqual(pickExports(item, 3).map((p) => p.export.scale), [3]);
+  assert.equal(pickExports(item, 3)[0].substituted, false);
+  // 用户说「要 1 倍图」
+  assert.deepEqual(pickExports(item, 1).map((p) => p.export.scale), [1]);
+});
+
+test("pickExports 缺少目标倍率时就近取，并标记 substituted", () => {
+  // 只有 3x，要 2x → 向上取 3x
+  const only3 = pickExports(mkSlice([3]));
+  assert.deepEqual(only3.map((p) => p.export.scale), [3]);
+  assert.equal(only3[0].substituted, true);
+
+  // 有 1x 和 3x，要 2x → 取不超过目标的最高档 1x
+  const oneThree = pickExports(mkSlice([1, 3]));
+  assert.deepEqual(oneThree.map((p) => p.export.scale), [1]);
+  assert.equal(oneThree[0].substituted, true);
+
+  // 用户要 4x 但只有 2x/3x → 取 3x，并标记替换
+  const up = pickExports(mkSlice([2, 3]), 4);
+  assert.deepEqual(up.map((p) => p.export.scale), [3]);
+  assert.equal(up[0].substituted, true);
+});
+
+test("pickExports 空导出返回空数组", () => {
+  assert.deepEqual(pickExports(mkSlice([])), []);
 });

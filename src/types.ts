@@ -135,6 +135,10 @@ export interface DownloadResult {
   name: string;
   /** 相对 outDir 的路径，便于调用方定位 */
   path: string;
+  /** 实际使用的导出倍率（默认 2x；该图层没有时会就近取） */
+  scale?: number;
+  /** 该图层没有请求的倍率，实际用了另一个倍率 */
+  substituted?: boolean;
   width: number;
   height: number;
   bytes: number;

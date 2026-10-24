@@ -93,6 +93,7 @@ npm run build
 |---|---|---|
 | `CODESIGN_COOKIE` | 读标注/切图必填 | CoDesign 登录 Cookie |
 | `CODESIGN_PASSWORD` | 否 | 默认分享访问密码，工具未传 `password` 时兜底 |
+| `CODESIGN_SCALE` | 否 | 默认切图倍率，默认 `2`；工具传了 `scale` 时以工具参数为准 |
 | `CODESIGN_OUT_DIR` | 否 | 默认输出目录，默认 `./codesign-assets` |
 | `CODESIGN_CONCURRENCY` | 否 | 并发请求数，默认 4，范围 1–16；被限流（429）时调小 |
 | `CODESIGN_TIMEOUT_MS` | 否 | 单次请求超时，默认 30000，范围 1000–120000 |
@@ -168,7 +169,19 @@ AI 会自动按这个顺序工作：
 | `password` | string | | 分享访问密码，密码保护的分享必填 |
 | `screenId` | number | | 画板 ID |
 | `outDir` | string | | 输出目录 |
-| `scale` | number | | 只下指定倍率（2 / 3），默认最高倍率 |
+| `scale` | number | | 导出倍率，默认 2 |
+
+**倍率优先级**：用户在对话里明确要求 > 环境变量 `CODESIGN_SCALE` > 内置默认 2x。
+
+某图层若没有目标倍率的导出，会就近取（优先取不高于目标的最高档），并在返回的 `warning` 里逐条列出，不会静默替换。返回值里的 `scaleUsage` 汇总了实际用到的倍率，`requestedScale` 是本次请求的倍率。
+
+```json
+{
+  "requestedScale": 2,
+  "scaleUsage": { "3": 44, "2.84": 2 },
+  "warning": "以下 46 张切图在设计稿里没有 2 倍导出，已就近取其他倍率：..."
+}
+```
 
 同名图层自动追加 `_2`、`_3`，不会互相覆盖。返回的 `path` 是相对 `outDir` 的文件名，和 `design_get_spec` 里的 `file` 字段一致。
 

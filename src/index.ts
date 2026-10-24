@@ -6,7 +6,7 @@ import { z } from "zod";
 import { CoDesignClient, parseScreenId, parseShareId } from "./client.js";
 import { isCoDesignError } from "./errors.js";
 import { buildSpec } from "./spec.js";
-import { downloadSlices, downloadPreviews, resolveScreens } from "./tools.js";
+import { DEFAULT_SCALE, downloadSlices, downloadPreviews, resolveScreens } from "./tools.js";
 import type { Layer } from "./types.js";
 import { createNamer } from "./utils/filename.js";
 
@@ -15,6 +15,7 @@ const DEFAULT_OUT = process.env.CODESIGN_OUT_DIR || "./codesign-assets";
 const DEFAULT_PASSWORD = process.env.CODESIGN_PASSWORD || undefined;
 const CONCURRENCY = clampInt(process.env.CODESIGN_CONCURRENCY, 4, 1, 16);
 const TIMEOUT_MS = clampInt(process.env.CODESIGN_TIMEOUT_MS, 30_000, 1_000, 120_000);
+// 默认倍数由 client 侧统一处理，这里只用于文档提示
 
 const client = new CoDesignClient(COOKIE, { timeoutMs: TIMEOUT_MS, defaultPassword: DEFAULT_PASSWORD });
 
@@ -85,7 +86,11 @@ server.registerTool(
     description: [
       "批量下载 CoDesign 画板的切图。",
       "自动把 OSS 签名地址转换为可下载的 CDN 地址，按图层名命名文件，同名自动加序号。",
-      "返回每个文件的相对路径、像素尺寸、字节数。",
+      `默认导出 ${DEFAULT_SCALE} 倍图。`,
+      "重要：如果用户在对话里明确说了要几倍图（例如「要 3 倍图」「导出 @2x」），",
+      "必须把倍数传给 scale 参数，用户指定的优先级高于默认值。",
+      "某图层若没有该倍率的导出，会就近取其他倍率并在 warning 里列出，不会静默替换。",
+      "返回每个文件的相对路径、像素尺寸、字节数和实际倍率。",
     ].join(""),
     inputSchema: {
       url: urlSchema,
@@ -96,7 +101,11 @@ server.registerTool(
         .number()
         .positive()
         .optional()
-        .describe("只下载指定倍率的切图，如 2 或 3；不传则下载最高倍率"),
+        .describe(
+          `导出倍率，默认 ${DEFAULT_SCALE}。` +
+            "用户明确要求几倍图时务必传这个参数（如用户说「3 倍图」就传 3）。" +
+            "该图层没有指定倍率时会就近取并在 warning 中说明。",
+        ),
     },
   },
   async (args) => run(() => handleDownloadSlices(args)),
@@ -257,7 +266,28 @@ async function handleDownloadSlices(args: {
 
   const total = results.reduce((n, r) => n + r.files.filter((f: any) => f.ok).length, 0);
   const failed = results.reduce((n, r) => n + r.files.filter((f: any) => !f.ok).length, 0);
-  return jsonResult({ outDir, total, failed, screens: results });
+
+  // 汇总实际用到的倍率：某个图层没有请求倍率时会被就近替换，这里如实反馈
+  const requestedScale = args.scale ?? DEFAULT_SCALE;
+  const scaleUsage: Record<string, number> = {};
+  const substituted: { name: string; scale: number }[] = [];
+  for (const r of results) {
+    for (const f of r.files) {
+      if (!f.ok || f.scale === undefined) continue;
+      scaleUsage[String(f.scale)] = (scaleUsage[String(f.scale)] ?? 0) + 1;
+      if (f.substituted) substituted.push({ name: f.name, scale: f.scale });
+    }
+  }
+
+  const payload: any = { outDir, requestedScale, total, failed, scaleUsage, screens: results };
+  if (substituted.length) {
+    payload.warning =
+      `以下 ${substituted.length} 张切图在设计稿里没有 ${requestedScale} 倍导出，已就近取其他倍率：\n` +
+      substituted.map((s) => `  ${s.name} → ${s.scale}x`).join("\n") +
+      "\n如需严格匹配，请确认设计稿里该图层导出的倍率。";
+  }
+
+  return jsonResult(payload);
 }
 
 async function handleDownloadPreviews(args: {

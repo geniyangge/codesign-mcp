@@ -8,6 +8,7 @@ import type {
   LayerTree,
   ScreenDetail,
   ShareInfo,
+  SliceExport,
   SliceItem,
 } from "./types.js";
 import { mapLimit } from "./utils/concurrency.js";
@@ -87,15 +88,49 @@ export async function resolveScreens(
   });
 }
 
-/** 每张切图只取目标倍率（默认最高），避免重复下载 */
-export function pickExports(item: SliceItem, scale?: number) {
+/** 默认导出倍率，可用环境变量 CODESIGN_SCALE 覆盖 */
+export const DEFAULT_SCALE = (() => {
+  const n = Number(process.env.CODESIGN_SCALE);
+  return Number.isFinite(n) && n > 0 ? n : 2;
+})();
+
+/** 每张切图最终选中的导出项，附带是否发生过倍率降级 */
+export interface PickedExport {
+  export: SliceExport;
+  /** 该图层没有请求的倍率，实际用了别的倍率 */
+  substituted: boolean;
+}
+
+/**
+ * 每张切图只取一个倍率，避免同一图层下载多份。
+ *
+ * 倍率优先级：
+ * 1. 调用方显式指定（用户在会话里说「要 3 倍图」）—— 优先满足
+ * 2. 环境变量 CODESIGN_SCALE
+ * 3. 内置默认 2x
+ *
+ * 若该图层没有正好这个倍率：就近取**不超过**目标的最高档，再退而取最低档，
+ * 并把 `substituted` 标出来，由上层如实告知，不静默替换。
+ */
+export function pickExports(item: SliceItem, scale?: number): PickedExport[] {
   if (!item.exports.length) return [];
-  if (scale !== undefined) {
-    const exact = item.exports.filter((e) => e.scale === scale);
-    if (exact.length) return exact;
-  }
-  const max = Math.max(...item.exports.map((e) => e.scale));
-  return item.exports.filter((e) => e.scale === max);
+
+  const target = scale ?? DEFAULT_SCALE;
+  const exactMatch = (s: number) => item.exports.filter((e) => e.scale === s);
+
+  const exact = exactMatch(target);
+  if (exact.length) return exact.map((e) => ({ export: e, substituted: false }));
+
+  const sorted = [...new Set(item.exports.map((e) => e.scale))].sort((a, b) => a - b);
+  // 优先取不超过目标的最高档（避免下载到比预期更大的文件）
+  const lower = sorted.filter((s) => s < target);
+  const fallback =
+    lower.length > 0
+      ? lower[lower.length - 1]
+      : // 只有更高档时向上取最小的一档
+        sorted[0];
+
+  return exactMatch(fallback).map((e) => ({ export: e, substituted: true }));
 }
 
 export interface DownloadOptions {
@@ -115,10 +150,10 @@ export async function downloadSlices(
   const namer = options.namer ?? createNamer();
 
   const tasks = slices.flatMap((item) =>
-    pickExports(item, options.scale).map((ex) => ({ item, ex })),
+    pickExports(item, options.scale).map((p) => ({ item, ex: p.export, substituted: p.substituted })),
   );
 
-  return mapLimit(tasks, options.concurrency ?? 6, async ({ item, ex }) => {
+  return mapLimit(tasks, options.concurrency ?? 6, async ({ item, ex, substituted }) => {
     // 文件名在下载前一次性分配，保证与 design_get_spec 里给出的名字一致且不互相覆盖
     const file = namer(sanitizeFilename(item.name, "slice"), ex.format);
     const path = join(outDir, file);
@@ -128,6 +163,9 @@ export async function downloadSlices(
       return {
         name: item.name,
         path: file,
+        // 实际落盘的倍率，可能与请求的倍率不同（该图层没导出这个倍率时）
+        scale: ex.scale,
+        substituted: substituted || undefined,
         width: ex.width,
         height: ex.height,
         bytes: buf.length,
@@ -137,6 +175,8 @@ export async function downloadSlices(
       return {
         name: item.name,
         path: file,
+        scale: ex.scale,
+        substituted: substituted || undefined,
         width: ex.width,
         height: ex.height,
         bytes: 0,
