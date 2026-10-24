@@ -254,12 +254,35 @@ CoDesign 没有开放 API，本项目通过逆向其内部接口实现：
 ## 开发
 
 ```bash
-npm run dev    # tsc --watch
-npm test       # 编译测试 + node:test 跑单测
-npm run build  # 产出 dist/
+npm run dev           # tsc --watch
+npm test              # 校验版本号 + 编译测试 + node:test 跑单测
+npm run build         # 产出 dist/
+npm run version:check # 校验版本号是否一致
+npm run version:sync  # 把 src/version.ts 的版本号同步到 package.json
 ```
 
 测试覆盖纯函数（链接解析、CDN 地址改写、文件名、并发池、规格生成）以及 client 的鉴权头、错误翻译与重试行为。
+
+### 发布新版本
+
+版本号只维护 **`src/version.ts`** 一处，`package.json` 是它的副本：
+
+```bash
+# 1. 改 src/version.ts 里的 VERSION
+# 2. 同步到 package.json
+npm run version:sync
+
+# 3. 同步到 package-lock.json
+npm install --package-lock-only
+
+# 4. 验证并提交打 tag
+npm run version:check
+git commit -am "chore: release v1.0.1"
+git tag -a 1.0.1 -m "v1.0.1"
+git push && git push origin 1.0.1
+```
+
+`npm test` 和 `prepublishOnly` 都会执行 `version:check`，两处版本号不一致时直接失败，避免漏同步。
 
 ## 常见问题
 

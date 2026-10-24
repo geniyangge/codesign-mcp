@@ -1,6 +1,6 @@
 {
   "name": "codesign-mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "MCP server for Tencent CoDesign — read design specs, layer annotations, and download slices",
   "type": "module",
   "bin": {
@@ -15,8 +15,10 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "start": "node dist/index.js",
-    "test": "tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js",
-    "prepublishOnly": "npm run build"
+    "version:check": "node scripts/version.mjs",
+    "version:sync": "node scripts/version.mjs --sync",
+    "test": "npm run version:check && tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js",
+    "prepublishOnly": "npm run version:check && npm run build"
   },
   "engines": {
     "node": ">=18.17"

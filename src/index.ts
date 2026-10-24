@@ -9,6 +9,7 @@ import { buildSpec } from "./spec.js";
 import { DEFAULT_SCALE, downloadSlices, downloadPreviews, resolveScreens } from "./tools.js";
 import type { Layer } from "./types.js";
 import { createNamer } from "./utils/filename.js";
+import { VERSION } from "./version.js";
 
 const COOKIE = process.env.CODESIGN_COOKIE || "";
 const DEFAULT_OUT = process.env.CODESIGN_OUT_DIR || "./codesign-assets";
@@ -19,7 +20,7 @@ const TIMEOUT_MS = clampInt(process.env.CODESIGN_TIMEOUT_MS, 30_000, 1_000, 120_
 
 const client = new CoDesignClient(COOKIE, { timeoutMs: TIMEOUT_MS, defaultPassword: DEFAULT_PASSWORD });
 
-const server = new McpServer({ name: "codesign-mcp", version: "1.0.0" });
+const server = new McpServer({ name: "codesign-mcp", version: VERSION });
 
 const urlSchema = z
   .string()
