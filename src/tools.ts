@@ -38,6 +38,7 @@ export interface ResolveOptions extends ScreenData {
 /**
  * 决定要处理哪些画板：显式指定 > 链接里的 > 全部。
  * 只按需拉取 meta / slices，且画板之间并发处理。
+ * 密码分享的解锁在 getShare 阶段完成，画板详情接口本身不需要 state-key。
  */
 export async function resolveScreens(
   client: CoDesignClient,

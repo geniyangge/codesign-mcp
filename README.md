@@ -92,6 +92,7 @@ npm run build
 | 变量 | 必填 | 说明 |
 |---|---|---|
 | `CODESIGN_COOKIE` | 读标注/切图必填 | CoDesign 登录 Cookie |
+| `CODESIGN_PASSWORD` | 否 | 默认分享访问密码，工具未传 `password` 时兜底 |
 | `CODESIGN_OUT_DIR` | 否 | 默认输出目录，默认 `./codesign-assets` |
 | `CODESIGN_CONCURRENCY` | 否 | 并发请求数，默认 4，范围 1–16；被限流（429）时调小 |
 | `CODESIGN_TIMEOUT_MS` | 否 | 单次请求超时，默认 30000，范围 1000–120000 |
@@ -122,6 +123,28 @@ AI 会自动按这个顺序工作：
 
 > 分享 ID 和画板 ID 都在设计稿链接里：`/app/s/<分享ID>/<画板ID>`。
 
+## 带密码的设计稿
+
+分享时勾选了「密码保护」的设计稿，直接读取会返回 403「请输入密码」，此时把密码作为 `password` 参数传入即可：
+
+```
+帮我读取并还原设计稿 https://codesign.qq.com/s/<分享ID>/<画板ID>/inspect，密码 ABCD
+```
+
+工具会自动：
+
+1. `POST /api/sharings/<id>/state-keys` 用密码换一个 `state-key`
+2. 后续分享详情请求带上 `state-key` 头（同一密码会缓存，不用反复换）
+3. 画板详情、图层和切图接口沿用原有 Cookie 鉴权，不需要 `state-key`
+
+也可以设一次环境变量，之后都不用传：
+
+```json
+"env": { "CODESIGN_PASSWORD": "ABCD" }
+```
+
+**密码解不开权限**：密码只解锁「分享内容」这一层。如果当前 `CODESIGN_COOKIE` 的账号不在设计稿所属项目里，密码正确仍会返回「您当前暂无权限」。这种情况需要换用有权限的账号，或让设计同学把账号加入项目。
+
 ## 工具参数
 
 ### design_get
@@ -129,6 +152,7 @@ AI 会自动按这个顺序工作：
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `url` | string | ✅ | 分享链接 |
+| `password` | string | | 分享访问密码，密码保护的分享必填 |
 | `screenId` | number | | 只解析指定画板 |
 | `includeLayers` | boolean | | 是否返回图层树，默认 true |
 | `maxLayers` | number | | 每个画板最多返回的图层数，默认 800 |
@@ -141,17 +165,21 @@ AI 会自动按这个顺序工作：
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `url` | string | ✅ | 分享链接 |
+| `password` | string | | 分享访问密码，密码保护的分享必填 |
 | `screenId` | number | | 画板 ID |
 | `outDir` | string | | 输出目录 |
 | `scale` | number | | 只下指定倍率（2 / 3），默认最高倍率 |
 
 同名图层自动追加 `_2`、`_3`，不会互相覆盖。返回的 `path` 是相对 `outDir` 的文件名，和 `design_get_spec` 里的 `file` 字段一致。
 
+导出格式同时有 `png` 和 `svg` 时都会下载。注意 `imageMogr2` 是腾讯云图片处理参数，只能处理位图，代码对 svg 会自动跳过（否则会返回 400 `InvalidImageFormat`）。
+
 ### design_download_previews
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `url` | string | ✅ | 分享链接 |
+| `password` | string | | 分享访问密码，密码保护的分享必填 |
 | `screenId` | number | | 画板 ID |
 | `outDir` | string | | 输出目录 |
 
@@ -162,6 +190,7 @@ AI 会自动按这个顺序工作：
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `url` | string | ✅ | 分享链接 |
+| `password` | string | | 分享访问密码，密码保护的分享必填 |
 | `screenId` | number | | 画板 ID |
 | `cssWidth` | number | | 目标 CSS 宽度，默认 375；传 750 输出原始 px |
 | `maxLayers` | number | | 最多输出多少图层，默认 500 |
@@ -176,10 +205,11 @@ CoDesign 没有开放 API，本项目通过逆向其内部接口实现：
 
 | 接口 | 鉴权 |
 |---|---|
-| `/api/sharings/<shareId>` | 无需登录 |
+| `/api/sharings/<shareId>` | 无需登录；密码分享需 `state-key` 头 |
+| `/api/sharings/<shareId>/state-keys` | `POST {password}` → `{key, expires}` |
 | `/api/designs/<designId>/screens/<screenId>` | Cookie + `Authorization: Bearer` |
 | `cdn4.codesign.qq.com/meta/...`（图层/切图 JSON） | 需 `Origin: https://codesign.qq.com` |
-| 切图 PNG | 同上，且 URL 必须带 `?imageMogr2/format/png` |
+| 切图图片 | 同上，位图需带 `?imageMogr2/format/png`，svg 不能带 |
 
 几个坑已在代码里处理（均经真实设计稿实测）：
 
@@ -194,6 +224,11 @@ CoDesign 没有开放 API，本项目通过逆向其内部接口实现：
 - 颜色 alpha 单位不固定：普通填充是 0–1，半透明遮罩会返回 `a:100`、`color-hex: "#000000 10000%"`，`css-rgba` 也是非法的 `rgba(0,0,0,100)`。代码会统一归一化
 - CoDesign 自带的 `css` 字段里也有非法 alpha（形如 `rgba(R,G,B,100)`），浏览器会整条丢弃，代码会修正后再用
 - 组图层本身通常没有 `css`，视觉效果要么来自子图层，要么由切图提供；两种情况代码都在 notes 里提示
+- 密码保护的分享：**带 Cookie 访问时返回的是「您当前暂无权限」而不是「请输入密码」**，无法从一次请求判断是否缺密码；代码会用一个不含 Cookie 的探测请求确认后再提示补密码
+- 密码错误返回 `403「密码错误！」`（不是 422）；`422` 只用于密码长度等格式校验
+- 接口返回的 JSON 会把中文转义成 `\uXXXX`，错误判断必须先解开 `message` 字段，否则永远匹配不到「请输入密码」
+- `imageMogr2` 只能处理位图，对 svg 会返回 `400 InvalidImageFormat`，代码按导出格式自动跳过
+- `fontStyleName` 既可能是 `"Bold"` 也可能是数字 `700`，两者都要能转成 CSS `font-weight`
 
 实现上有几点值得一提：
 

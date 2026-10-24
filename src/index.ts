@@ -12,10 +12,11 @@ import { createNamer } from "./utils/filename.js";
 
 const COOKIE = process.env.CODESIGN_COOKIE || "";
 const DEFAULT_OUT = process.env.CODESIGN_OUT_DIR || "./codesign-assets";
+const DEFAULT_PASSWORD = process.env.CODESIGN_PASSWORD || undefined;
 const CONCURRENCY = clampInt(process.env.CODESIGN_CONCURRENCY, 4, 1, 16);
 const TIMEOUT_MS = clampInt(process.env.CODESIGN_TIMEOUT_MS, 30_000, 1_000, 120_000);
 
-const client = new CoDesignClient(COOKIE, { timeoutMs: TIMEOUT_MS });
+const client = new CoDesignClient(COOKIE, { timeoutMs: TIMEOUT_MS, defaultPassword: DEFAULT_PASSWORD });
 
 const server = new McpServer({ name: "codesign-mcp", version: "1.0.0" });
 
@@ -23,6 +24,14 @@ const urlSchema = z
   .string()
   .min(1)
   .describe("CoDesign 分享链接，如 https://codesign.qq.com/app/s/<分享ID>");
+const passwordSchema = z
+  .string()
+  .min(1)
+  .optional()
+  .describe(
+    "分享访问密码。若设计稿开启了密码保护，接口会返回 403「请输入密码」，此时必须提供。" +
+      `不传则使用环境变量 CODESIGN_PASSWORD${DEFAULT_PASSWORD ? "（当前已配置）" : "（当前未配置）"}。`,
+  );
 const screenIdSchema = z
   .number()
   .int()
@@ -47,6 +56,7 @@ server.registerTool(
     ].join(""),
     inputSchema: {
       url: urlSchema,
+      password: passwordSchema,
       screenId: screenIdSchema,
       includeLayers: z.boolean().optional().describe("是否返回图层标注树，默认 true"),
       maxLayers: z
@@ -79,6 +89,7 @@ server.registerTool(
     ].join(""),
     inputSchema: {
       url: urlSchema,
+      password: passwordSchema,
       screenId: screenIdSchema,
       outDir: outDirSchema,
       scale: z
@@ -101,6 +112,7 @@ server.registerTool(
     ].join(""),
     inputSchema: {
       url: urlSchema,
+      password: passwordSchema,
       screenId: screenIdSchema,
       outDir: outDirSchema,
     },
@@ -119,6 +131,7 @@ server.registerTool(
     ].join(""),
     inputSchema: {
       url: urlSchema,
+      password: passwordSchema,
       screenId: screenIdSchema,
       cssWidth: z
         .number()
@@ -156,12 +169,13 @@ async function run(handler: () => Promise<ReturnType<typeof jsonResult>>) {
 
 async function handleDesignGet(args: {
   url: string;
+  password?: string;
   screenId?: number;
   includeLayers?: boolean;
   maxLayers?: number;
   maxDepth?: number;
 }) {
-  const share = await client.getShare(parseShareId(args.url));
+  const share = await client.getShare(parseShareId(args.url), args.password || undefined);
   const includeLayers = args.includeLayers !== false;
   const targets = await resolveScreens(
     client,
@@ -217,11 +231,12 @@ async function handleDesignGet(args: {
 
 async function handleDownloadSlices(args: {
   url: string;
+  password?: string;
   screenId?: number;
   outDir?: string;
   scale?: number;
 }) {
-  const share = await client.getShare(parseShareId(args.url));
+  const share = await client.getShare(parseShareId(args.url), args.password || undefined);
   const targets = await resolveScreens(client, share, args.screenId ?? parseScreenId(args.url), {
     slices: true,
     concurrency: CONCURRENCY,
@@ -247,10 +262,11 @@ async function handleDownloadSlices(args: {
 
 async function handleDownloadPreviews(args: {
   url: string;
+  password?: string;
   screenId?: number;
   outDir?: string;
 }) {
-  const share = await client.getShare(parseShareId(args.url));
+  const share = await client.getShare(parseShareId(args.url), args.password || undefined);
   // 预览只需要画板详情，不必拉图层树和切图清单
   const targets = await resolveScreens(client, share, args.screenId ?? parseScreenId(args.url), {
     concurrency: CONCURRENCY,
@@ -266,12 +282,13 @@ async function handleDownloadPreviews(args: {
 
 async function handleGetSpec(args: {
   url: string;
+  password?: string;
   screenId?: number;
   cssWidth?: number;
   maxLayers?: number;
   maxDepth?: number;
 }) {
-  const share = await client.getShare(parseShareId(args.url));
+  const share = await client.getShare(parseShareId(args.url), args.password || undefined);
   const explicit = args.screenId ?? parseScreenId(args.url);
   const targets = await resolveScreens(client, share, explicit, {
     meta: true,

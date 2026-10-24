@@ -116,9 +116,15 @@ function styleFor(l: Layer, scale: number): string[] {
   return css;
 }
 
-/** 设计稿字体粗细名称 → CSS 数值 */
-function mapFontWeight(styleName: string): string {
-  const s = styleName.toLowerCase();
+/** 设计稿字体粗细名称/数值 → CSS 数值 */
+export function mapFontWeight(styleName: string | number | undefined): string {
+  if (styleName === undefined || styleName === null || styleName === "") return "400";
+  // 数字或纯数字字符串直接当字重值用
+  if (typeof styleName === "number" && Number.isFinite(styleName)) return String(styleName);
+  const raw = String(styleName).trim();
+  if (/^\d+$/.test(raw)) return raw;
+
+  const s = raw.toLowerCase();
   if (/thin|hairline/.test(s)) return "100";
   if (/extra.?light|ultra.?light/.test(s)) return "200";
   if (/light/.test(s)) return "300";

@@ -2,6 +2,7 @@ import {
   CoDesignError,
   explainError,
   explainNetworkError,
+  isCoDesignError,
 } from "./errors.js";
 import type {
   DesignRef,
@@ -27,6 +28,8 @@ export interface ClientOptions {
   timeoutMs?: number;
   /** 幂等请求的重试次数（不含首次） */
   retries?: number;
+  /** 环境变量里配置的默认访问密码，工具未显式传 password 时作为兜底 */
+  defaultPassword?: string;
 }
 
 /** 从分享链接里解析分享 ID，兼容带不带 hash 前缀的写法 */
@@ -71,11 +74,15 @@ export class CoDesignClient {
   private readonly cookieTeamId?: string;
   private readonly timeoutMs: number;
   private readonly retries: number;
+  private readonly defaultPassword?: string;
+  /** 分享密码 → state-key 缓存，密码有效期由服务端决定（响应里带 expires） */
+  private readonly stateKeys = new Map<string, { key: string; expires: number }>();
 
   constructor(cookie?: string, options: ClientOptions = {}) {
     this.cookie = (cookie ?? "").trim();
     this.timeoutMs = options.timeoutMs ?? 30_000;
     this.retries = Math.max(0, options.retries ?? 2);
+    this.defaultPassword = options.defaultPassword?.trim() || undefined;
     if (this.cookie) {
       const jar = parseCookies(this.cookie);
       this.accessToken = jar.access_token;
@@ -85,6 +92,50 @@ export class CoDesignClient {
 
   get hasCookie(): boolean {
     return this.cookie.length > 0;
+  }
+
+  /**
+   * 用访问密码换 state-key。
+   * 带密码的分享，`GET /api/sharings/:id` 会返回 403「请输入密码！」，
+   * 必须先 `POST /api/sharings/:id/state-keys` 拿 key，再以 `state-key` 头访问。
+   * 注意画板详情接口不需要这个头。
+   */
+  async exchangePassword(shareId: number, password: string): Promise<string> {
+    const cacheKey = `${shareId}:${password}`;
+    const cached = this.stateKeys.get(cacheKey);
+    if (cached && cached.expires * 1000 > Date.now()) return cached.key;
+
+    const res = await this.send(`${BASE}/api/sharings/${shareId}/state-keys`, {
+      method: "POST",
+      headers: { ...this.authHeaders(), referer: `${BASE}/s/${shareId}`, "content-type": "application/json" },
+      body: JSON.stringify({ password }),
+    });
+
+    const text = await res.text();
+    if (!res.ok) {
+      // 错误密码返回 422，错误信息形如「password 必须是 4 个字符」
+      throw explainError(res.status, text, `${BASE}/api/sharings/${shareId}/state-keys`);
+    }
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new CoDesignError(
+        "密码校验接口返回了非 JSON 内容",
+        res.status,
+        "接口可能已变更，请检查 CoDesign 是否改了分享密码机制。",
+      );
+    }
+
+    const key = parsed?.key;
+    if (typeof key !== "string" || !key) {
+      throw new CoDesignError("密码校验未返回 state-key", res.status);
+    }
+
+    const expires = typeof parsed.expires === "number" ? parsed.expires : Math.floor(Date.now() / 1000) + 3600;
+    this.stateKeys.set(cacheKey, { key, expires });
+    return key;
   }
 
   /** 鉴权接口：Cookie + Bearer（两者缺一不可，只带 Cookie 会返回「非项目成员」） */
@@ -148,17 +199,53 @@ export class CoDesignClient {
   }
 
   /**
-   * 设计稿元数据。无需登录即可拿到标题、团队、画板列表。
-   * 唯一不需要 Cookie 的接口。
+   * 设计稿元数据。公开分享无需登录即可拿到标题、团队、画板列表；
+   * 带密码的分享需要传 password，内部会先换 state-key 再请求。
    */
-  async getShare(shareId: number): Promise<ShareInfo> {
-    const raw = await this.request<any>(`${BASE}/api/sharings/${shareId}`, {
-      headers: {
-        accept: "application/json",
-        referer: `${BASE}/app/s/${shareId}`,
-        "user-agent": UA,
-      },
-    });
+  async getShare(shareId: number, password?: string): Promise<ShareInfo> {
+    // 未显式传密码时退回环境变量里配置的默认密码
+    const pwd = password?.trim() || this.defaultPassword;
+
+    // 有密码就先换 key；没密码则直接请求
+    let stateKey = pwd ? await this.exchangePassword(shareId, pwd) : undefined;
+
+    const fetchShare = (key?: string) =>
+      this.request<any>(`${BASE}/api/sharings/${shareId}`, {
+        headers: {
+          accept: "application/json",
+          referer: `${BASE}/s/${shareId}`,
+          "user-agent": UA,
+          ...(key ? { "state-key": key } : {}),
+        },
+      });
+
+    let raw: any;
+    try {
+      raw = await fetchShare(stateKey);
+    } catch (e) {
+      // 带 Cookie 请求密码分享时，服务端返回的是「您当前暂无权限」而不是「请输入密码」，
+      // 无法从这一条判断是否缺密码。用不含 Cookie / Bearer 的探测请求确认一下。
+      if (!stateKey && isCoDesignError(e) && e.code === "NO_PERMISSION" && (await this.needsPassword(shareId))) {
+        if (this.defaultPassword) {
+          raw = await fetchShare(await this.exchangePassword(shareId, this.defaultPassword));
+        } else {
+          throw new CoDesignError(
+            `设计稿（分享 ${shareId}）需要访问密码`,
+            403,
+            [
+              "该分享开启了密码保护，需要提供访问密码。",
+              "请把密码作为 password 参数传入，或设置环境变量 CODESIGN_PASSWORD。",
+              '例如：design_get(url, password: "ABCD")',
+              "提示：若密码正确仍报「无权限」，说明当前 Cookie 账号不在项目内，",
+              "      密码只能解锁分享，解不开团队权限。",
+            ].join("\n"),
+            "NEED_PASSWORD",
+          );
+        }
+      } else {
+        throw e;
+      }
+    }
 
     const designs: DesignRef[] = (raw.designs ?? []).map((d: any) => {
       const screens: ScreenRef[] = [];
@@ -243,8 +330,8 @@ export class CoDesignClient {
         width: ex.screenshot?.width ?? ex.size ?? 0,
         height: ex.screenshot?.height ?? ex.size ?? 0,
         // 清单里给的是 OSS 签名地址，直接下会 AccessDenied，
-        // 换到 CDN 域名并加 imageMogr2 参数才可下载
-        downloadUrl: toCdnUrl(ex.screenshot?.url ?? "", DEFAULT_CDN_HOST),
+        // 换到 CDN 域名并加 imageMogr2 参数才可下载（svg 会跳过该参数）
+        downloadUrl: toCdnUrl(ex.screenshot?.url ?? "", DEFAULT_CDN_HOST, ex.format),
         objectId: String(ex.object_id ?? item.object_id ?? ""),
       })),
     }));
@@ -258,6 +345,35 @@ export class CoDesignClient {
       throw explainError(res.status, body, url);
     }
     return Buffer.from(await res.arrayBuffer());
+  }
+
+  /**
+   * 探测某个分享是否设置了访问密码。
+   * 不带 Cookie/Bearer 请求分享详情：密码分享会返回 403「请输入密码！」，
+   * 普通分享则正常返回 200。仅用于诊断，失败时按「不需要密码」处理。
+   */
+  private async needsPassword(shareId: number): Promise<boolean> {
+    try {
+      const res = await this.send(`${BASE}/api/sharings/${shareId}`, {
+        headers: {
+          accept: "application/json",
+          referer: `${BASE}/s/${shareId}`,
+          "user-agent": UA,
+        },
+      });
+      if (res.ok) return false;
+      const body = await res.text().catch(() => "");
+      const message = (() => {
+        try {
+          return String(JSON.parse(body)?.message ?? "");
+        } catch {
+          return body;
+        }
+      })();
+      return res.status === 403 && message.includes("请输入密码");
+    } catch {
+      return false;
+    }
   }
 
   private requireCookie(action: string) {
@@ -287,21 +403,33 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** 把 OSS 直链换成可下载的 CDN 直链 */
-export function toCdnUrl(url: string, cdnHost = DEFAULT_CDN_HOST): string {
+/**
+ * 把 OSS 直链换成可下载的 CDN 直链。
+ * 注意：`imageMogr2` 是腾讯云图片处理参数，只能处理位图；
+ * 对 svg 这类矢量格式会直接报 `InvalidImageFormat` 400，必须跳过。
+ */
+export function toCdnUrl(url: string, cdnHost = DEFAULT_CDN_HOST, format?: string): string {
   if (!url) return "";
   try {
     const u = new URL(url);
-    // cdn4.codesign.qq.com 走腾讯云图片服务，必须带 imageMogr2 才放行
+    const isVector = isVectorFormat(format) || /\.svgz?$/i.test(u.pathname);
+    // cdn4.codesign.qq.com 走腾讯云图片服务，位图必须带 imageMogr2 才放行
     if (/^cdn\d*\.codesign\.qq\.com$/.test(u.hostname)) {
+      if (isVector) return url;
       return /imageMogr2/.test(url) ? url : appendImageMogr2(url, u);
     }
     // OSS 签名直链：换域名 + 补参数
     const host = cdnHost.replace(/\/$/, "");
-    return appendImageMogr2(`${host}${u.pathname}${u.search}`, u);
+    const rebuilt = `${host}${u.pathname}${u.search}`;
+    if (isVector) return rebuilt;
+    return appendImageMogr2(rebuilt, u);
   } catch {
     return url;
   }
+}
+
+function isVectorFormat(format?: string): boolean {
+  return typeof format === "string" && /^(svg|svgz|pdf|eps|ai)$/i.test(format.trim());
 }
 
 /** 追加 imageMogr2 时按 URL 解析结果判断分隔符，避免签名链接里已带 ? 时拼错 */
@@ -503,8 +631,9 @@ function normalizeText(l: any): Layer["text"] {
 
   return {
     content: resolveTextContent(l),
-    fontName: tr.fontName ?? l.fontFace ?? "",
-    fontStyleName: tr.fontStyleName ?? l.fontWeight ?? "",
+    fontName: String(tr.fontName ?? l.fontFace ?? ""),
+    // 字重字段在不同文件里既可能是 "Bold" 也可能是 700，统一成字重值
+    fontStyleName: normalizeFontWeight(tr.fontStyleName ?? l.fontWeight),
     size,
     tracking: tr.tracking,
     leading,
@@ -514,6 +643,16 @@ function normalizeText(l: any): Layer["text"] {
     textAlign: l.textAlign,
     allCaps: false,
   };
+}
+
+/** 设计稿的字重可能是数字 700、字符串 "700" 或 "Bold" */
+function normalizeFontWeight(v: unknown): string {
+  if (typeof v === "number" && Number.isFinite(v)) return String(v);
+  if (typeof v === "string") {
+    // "Bold" / "Heavy" 这类保留原名，交给后面映射
+    return /^\d+$/.test(v.trim()) ? v.trim() : v;
+  }
+  return "";
 }
 
 /** textKey 才是正文；图层名只是设计工具里的标签 */
